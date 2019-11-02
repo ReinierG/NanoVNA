@@ -71,7 +71,7 @@ enum {
   ST_START, ST_STOP, ST_CENTER, ST_SPAN, ST_CW
 };
 
-void set_sweep_frequency(int type, float frequency);
+void set_sweep_frequency(int type, int32_t frequency);
 uint32_t get_sweep_frequency(int type);
 
 float my_atof(const char *p);
@@ -85,6 +85,9 @@ extern int8_t sweep_enabled;
  */
 extern void ui_init(void);
 extern void ui_process(void);
+
+enum { OP_NONE = 0, OP_LEVER, OP_TOUCH, OP_FREQCHANGE };
+extern uint8_t operation_requested;
 
 /*
  * dsp.c
@@ -106,29 +109,16 @@ void calculate_gamma(float *gamma);
 void fetch_amplitude(float *gamma);
 void fetch_amplitude_ref(float *gamma);
 
-int si5351_set_frequency_with_offset(int freq, int offset, uint8_t drive_strength);
+int si5351_set_frequency_with_offset(uint32_t freq, int offset, uint8_t drive_strength);
 
 
 /*
  * tlv320aic3204.c
  */
-typedef struct {
-  int target_level;
-  int gain_hysteresis;
-  int attack;
-  int attack_scale;
-  int decay;
-  int decay_scale;
-} tlv320aic3204_agc_config_t;
 
 extern void tlv320aic3204_init(void);
 extern void tlv320aic3204_set_gain(int lgain, int rgain);
-extern void tlv320aic3204_set_digital_gain(int gain);
-extern void tlv320aic3204_set_volume(int gain);
-extern void tlv320aic3204_agc_config(tlv320aic3204_agc_config_t *conf);
-extern void tlv320aic3204_select_in1(void);
-extern void tlv320aic3204_select_in3(void);
-extern void tlv320aic3204_adc_filter_enable(int enable);
+extern void tlv320aic3204_select(int channel);
 
 
 /*
@@ -149,8 +139,8 @@ extern int area_height;
 
 // font
 
-extern const uint16_t x5x7_bits [];
-extern const uint32_t numfont20x24[][24];
+extern const uint8_t x5x7_bits [];
+extern const uint8_t numfont20x22[][22 * 3];
 
 #define S_PI    "\034"
 #define S_MICRO "\035"
@@ -195,6 +185,7 @@ typedef struct {
   uint16_t trace_color[TRACES_MAX];
   int16_t touch_cal[4];
   int8_t default_loadcal;
+  uint32_t harmonic_freq_threshold;
   int32_t checksum;
 } config_t;
 
@@ -236,6 +227,7 @@ void redraw_marker(int marker, int update_info);
 void trace_get_info(int t, char *buf, int len);
 void plot_into_index(float measured[2][101][2]);
 void force_set_markmap(void);
+void draw_frequencies(void);
 void draw_all(bool flush);
 
 void draw_cal_status(void);
@@ -264,10 +256,10 @@ typedef struct {
 	uint16_t height;
 	uint16_t scaley;
 	uint16_t slide;
-	const uint32_t *bitmap;
+	const uint8_t *bitmap;
 } font_t;
 
-extern const font_t NF20x24;
+extern const font_t NF20x22;
 
 extern uint16_t spi_buffer[1024];
 
@@ -360,6 +352,8 @@ void ui_hide(void);
 
 extern uint8_t operation_requested;
 
+void touch_start_watchdog(void);
+void touch_position(int *x, int *y);
 void handle_touch_interrupt(void);
 
 #define TOUCH_THRESHOLD 2000

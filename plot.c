@@ -8,7 +8,6 @@
 #define SWAP(x,y) do { int z=x; x = y; y = z; } while(0)
 
 static void cell_draw_marker_info(int m, int n, int w, int h);
-void draw_frequencies(void);
 void frequency_string(char *buf, size_t len, int32_t freq);
 void markmap_all_markers(void);
 
@@ -441,6 +440,21 @@ float phase(float *v)
 }
 
 /*
+ * calculate groupdelay
+ */
+float groupdelay(float *v, float *w, float deltaf)
+{
+#if 1
+  // atan(w)-atan(v) = atan((w-v)/(1+wv))
+  float r = w[0]*v[1] - w[1]*v[0];
+  float i = w[0]*v[0] + w[1]*v[1];
+  return atan2f(r, i) / (2 * M_PI * deltaf);
+#else
+  return (atan2f(w[0], w[1]) - atan2f(v[0], v[1])) / (2 * M_PI * deltaf);
+#endif
+}
+
+/*
  * calculate abs(gamma)
  */
 float linear(float *v)
@@ -488,12 +502,27 @@ cartesian_scale(float re, float im, int *xp, int *yp, float scale)
   *yp = HEIGHT/2 - y;
 }
 
+static float
+groupdelay_from_array(int i, float array[101][2])
+{
+  if (i == 0) {
+    float deltaf = frequencies[1] - frequencies[0];
+    return groupdelay(array[0], array[1], deltaf);
+  } else if (i == 100) {
+    float deltaf = frequencies[i] - frequencies[i-1];
+    return groupdelay(array[i-1], array[i], deltaf);
+  } else {
+    float deltaf = frequencies[i+1] - frequencies[i-1];
+    return groupdelay(array[i-1], array[i+1], deltaf);
+  }
+}
 
 uint32_t
-trace_into_index(int x, int t, int i, float coeff[2])
+trace_into_index(int x, int t, int i, float array[101][2])
 {
   int y = 0;
   float v = 0;
+  float *coeff = array[i];
   float refpos = 8 - get_trace_refpos(t);
   float scale = 1 / get_trace_scale(t);
   switch (trace[t].type) {
@@ -502,6 +531,9 @@ trace_into_index(int x, int t, int i, float coeff[2])
     break;
   case TRC_PHASE:
     v = refpos - phase(coeff) * scale;
+    break;
+  case TRC_DELAY:
+    v = refpos - groupdelay_from_array(i, array) * scale;
     break;
   case TRC_LINEAR:
     v = refpos + linear(coeff) * scale;
@@ -614,7 +646,7 @@ gamma2imp(char *buf, int len, const float coeff[2], uint32_t frequency)
 }
 
 static void
-gamma2resistance(char *buf, int len, const float coeff[2], uint32_t frequency)
+gamma2resistance(char *buf, int len, const float coeff[2])
 {
   float z0 = 50;
   float d = z0 / ((1-coeff[0])*(1-coeff[0])+coeff[1]*coeff[1]);
@@ -623,7 +655,7 @@ gamma2resistance(char *buf, int len, const float coeff[2], uint32_t frequency)
 }
 
 static void
-gamma2reactance(char *buf, int len, const float coeff[2], uint32_t frequency)
+gamma2reactance(char *buf, int len, const float coeff[2])
 {
   float z0 = 50;
   float d = z0 / ((1-coeff[0])*(1-coeff[0])+coeff[1]*coeff[1]);
@@ -632,8 +664,9 @@ gamma2reactance(char *buf, int len, const float coeff[2], uint32_t frequency)
 }
 
 static void
-trace_get_value_string(int t, char *buf, int len, float coeff[2], uint32_t frequency)
+trace_get_value_string(int t, char *buf, int len, float array[101][2], int i)
 {
+  float *coeff = array[i];
   float v;
   switch (trace[t].type) {
   case TRC_LOGMAG:
@@ -647,6 +680,10 @@ trace_get_value_string(int t, char *buf, int len, float coeff[2], uint32_t frequ
     v = phase(coeff);
     chsnprintf(buf, len, "%.2f" S_DEGREE, v);
     break;
+  case TRC_DELAY:
+    v = groupdelay_from_array(i, array);
+    string_value_with_prefix(buf, len, v, 's');
+    break;
   case TRC_LINEAR:
     v = linear(coeff);
     chsnprintf(buf, len, "%.2f", v);
@@ -656,7 +693,7 @@ trace_get_value_string(int t, char *buf, int len, float coeff[2], uint32_t frequ
     chsnprintf(buf, len, "%.2f", v);
     break;
   case TRC_SMITH:
-    gamma2imp(buf, len, coeff, frequency);
+    gamma2imp(buf, len, coeff, frequencies[i]);
     break;
   case TRC_REAL:
     chsnprintf(buf, len, "%.2f", coeff[0]);
@@ -665,10 +702,10 @@ trace_get_value_string(int t, char *buf, int len, float coeff[2], uint32_t frequ
     chsnprintf(buf, len, "%.2fj", coeff[1]);
     break;
   case TRC_R:
-    gamma2resistance(buf, len, coeff, frequency);
+    gamma2resistance(buf, len, coeff);
     break;
   case TRC_X:
-    gamma2reactance(buf, len, coeff, frequency);
+    gamma2reactance(buf, len, coeff);
     break;
   //case TRC_ADMIT:
   case TRC_POLAR:
@@ -744,7 +781,7 @@ clear_markmap(void)
   memset(markmap[current_mappage], 0, sizeof markmap[current_mappage]);
 }
 
-void inline
+inline void
 force_set_markmap(void)
 {
   memset(markmap[current_mappage], 0xff, sizeof markmap[current_mappage]);
@@ -805,7 +842,7 @@ void plot_into_index(float measured[2][101][2])
       if (!trace[t].enabled)
         continue;
       int n = trace[t].channel;
-      trace_index[t][i] = trace_into_index(x, t, i, measured[n][i]);
+      trace_index[t][i] = trace_into_index(x, t, i, measured[n]);
     }
   }
 #if 0
@@ -1019,7 +1056,7 @@ draw_marker(int w, int h, int x, int y, int c, int ch)
       int cc = c;
       if (j <= 9 && j > 2 && i >= -1 && i <= 3) {
         uint16_t bits = x5x7_bits[(ch * 7) + (9-j)];
-        if (bits & (0x8000>>(i+1)))
+        if (bits & (0x80>>(i+1)))
           cc = 0;
       }
       if (y0 >= 0 && y0 < h && x0 >= 0 && x0 < w)
@@ -1318,7 +1355,7 @@ request_to_draw_cells_behind_numeric_input(void)
 void
 cell_drawchar_5x7(int w, int h, uint8_t ch, int x, int y, uint16_t fg, int invert)
 {
-  uint16_t bits;
+  uint8_t bits;
   int c, r;
   if (y <= -7 || y >= h || x <= -5 || x >= w)
     return;
@@ -1329,7 +1366,7 @@ cell_drawchar_5x7(int w, int h, uint8_t ch, int x, int y, uint16_t fg, int inver
     if (invert)
       bits = ~bits;
     for (r = 0; r < 5; r++) {
-      if ((x+r) >= 0 && (x+r) < w && (0x8000 & bits)) 
+      if ((x+r) >= 0 && (x+r) < w && (0x80 & bits)) 
         spi_buffer[(y+c)*w + (x+r)] = fg;
       bits <<= 1;
     }
@@ -1380,10 +1417,27 @@ cell_draw_marker_info(int m, int n, int w, int h)
     trace_get_info(t, buf, sizeof buf);
     cell_drawstring_5x7(w, h, buf, xpos, ypos, config.trace_color[t]);
     xpos += 64;
-    trace_get_value_string(t, buf, sizeof buf, measured[trace[t].channel][idx], frequencies[idx]);
+    trace_get_value_string(t, buf, sizeof buf, measured[trace[t].channel], idx);
     cell_drawstring_5x7(w, h, buf, xpos, ypos, config.trace_color[t]);
     j++;
   }    
+
+  if (electrical_delay != 0) {
+    // draw electrical delay
+    int xpos = 21;
+    int ypos = 1 + (j/2)*7;
+    xpos -= m * CELLWIDTH -CELLOFFSETX;
+    ypos -= n * CELLHEIGHT;
+    chsnprintf(buf, sizeof buf, "Edelay");
+    cell_drawstring_5x7(w, h, buf, xpos, ypos, 0xffff);
+    xpos += 7 * 5;
+    int n = string_value_with_prefix(buf, sizeof buf, electrical_delay * 1e-12, 's');
+    cell_drawstring_5x7(w, h, buf, xpos, ypos, 0xffff);
+    xpos += n * 5 + 5;
+    float light_speed_ps = 299792458e-12; //(m/ps)
+    string_value_with_prefix(buf, sizeof buf, electrical_delay * light_speed_ps * velocity_factor / 100.0, 'm');
+    cell_drawstring_5x7(w, h, buf, xpos, ypos, 0xffff);
+  }
 
   // draw marker frequency
   int xpos = 192;
@@ -1391,15 +1445,18 @@ cell_draw_marker_info(int m, int n, int w, int h)
   xpos -= m * CELLWIDTH -CELLOFFSETX;
   ypos -= n * CELLHEIGHT;
   chsnprintf(buf, sizeof buf, "%d:", active_marker + 1);
+  xpos += 5;
   cell_drawstring_5x7(w, h, buf, xpos, ypos, 0xffff);
-  xpos += 16;
+  xpos += 14;
   if ((domain_mode & DOMAIN_MODE) == DOMAIN_FREQ) {
-      frequency_string(buf, sizeof buf, frequencies[idx]);
-      cell_drawstring_5x7(w, h, buf, xpos, ypos, 0xffff);
+    frequency_string(buf, sizeof buf, frequencies[idx]);
   } else {
-      chsnprintf(buf, sizeof buf, "%d ns %.1f m", (uint16_t)(time_of_index(idx) * 1e9), distance_of_index(idx));
-      cell_drawstring_5x7(w, h, buf, xpos, ypos, 0xffff);
+    //chsnprintf(buf, sizeof buf, "%d ns %.1f m", (uint16_t)(time_of_index(idx) * 1e9), distance_of_index(idx));
+    int n = string_value_with_prefix(buf, sizeof buf, time_of_index(idx), 's');
+    buf[n++] = ' ';
+    string_value_with_prefix(&buf[n], sizeof buf-n, distance_of_index(idx), 'm');
   }
+  cell_drawstring_5x7(w, h, buf, xpos, ypos, 0xffff);
 
   // draw marker delta
   if (previous_marker >= 0 && active_marker != previous_marker && markers[previous_marker].enabled) {
@@ -1409,8 +1466,16 @@ cell_draw_marker_info(int m, int n, int w, int h)
     ypos += 7;
     chsnprintf(buf, sizeof buf, "\001%d:", previous_marker+1);
     cell_drawstring_5x7(w, h, buf, xpos, ypos, 0xffff);
-    xpos += 16;
-    frequency_string(buf, sizeof buf, frequencies[idx] - frequencies[idx0]);
+    xpos += 19;
+    if ((domain_mode & DOMAIN_MODE) == DOMAIN_FREQ) {
+      frequency_string(buf, sizeof buf, frequencies[idx] - frequencies[idx0]);
+    } else {
+      //chsnprintf(buf, sizeof buf, "%d ns %.1f m", (uint16_t)(time_of_index(idx) * 1e9 - time_of_index(idx0) * 1e9),
+      //                                            distance_of_index(idx) - distance_of_index(idx0));
+      int n = string_value_with_prefix(buf, sizeof buf, time_of_index(idx) - time_of_index(idx0), 's');
+      buf[n++] = ' ';
+      string_value_with_prefix(&buf[n], sizeof buf - n, distance_of_index(idx) - distance_of_index(idx0), 'm');
+    }
     cell_drawstring_5x7(w, h, buf, xpos, ypos, 0xffff);
   }
 }

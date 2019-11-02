@@ -32,21 +32,24 @@
 #include <ctype.h>
 #include <math.h>
 
-#define ENABLED_DUMP
+//#define ENABLED_DUMP
 
-static void apply_error_term(void);
 static void apply_error_term_at(int i);
+static void apply_edelay_at(int i);
 static void cal_interpolate(int s);
+void update_frequencies(void);
+void set_frequencies(uint32_t start, uint32_t stop, int16_t points);
 
 bool sweep(bool break_on_operation);
 
 static MUTEX_DECL(mutex);
 
 #define DRIVE_STRENGTH_AUTO (-1)
-#define FREQ_HARMONICS 300000000
+#define FREQ_HARMONICS (config.harmonic_freq_threshold)
+#define IS_HARMONIC_MODE(f) ((f) > FREQ_HARMONICS)
 
 int32_t frequency_offset = 5000;
-int32_t frequency = 10000000;
+uint32_t frequency = 10000000;
 int8_t drive_strength = DRIVE_STRENGTH_AUTO;
 int8_t sweep_enabled = TRUE;
 int8_t sweep_once = FALSE;
@@ -145,7 +148,7 @@ transform_domain(void)
   // and calculate ifft for time domain
   float* tmp = (float*)spi_buffer;
 
-  uint8_t window_size, offset;
+  uint8_t window_size = 101, offset = 0;
   uint8_t is_lowpass = FALSE;
   switch (domain_mode & TD_FUNC) {
       case TD_FUNC_BANDPASS:
@@ -257,37 +260,33 @@ static void cmd_reset(BaseSequentialStream *chp, int argc, char *argv[])
       ;
 }
 
-int set_frequency(int freq)
+const int8_t gain_table[] = {
+  0,  // 0 ~ 300MHz
+  40, // 300 ~ 600MHz
+  50, // 600 ~ 900MHz
+  75, // 900 ~ 1200MHz
+  85, // 1200 ~ 1400MHz
+  95  // 1400MHz ~
+};
+
+#define DELAY_GAIN_CHANGE 10
+
+static int
+adjust_gain(int newfreq)
 {
-    int delay = 0;
-    if (frequency == freq)
-      return delay;
+  int delay = 0;
+  int new_order = newfreq / FREQ_HARMONICS;
+  int old_order = frequency / FREQ_HARMONICS;
+  if (new_order != old_order) {
+    tlv320aic3204_set_gain(gain_table[new_order], gain_table[new_order]);
+    delay += DELAY_GAIN_CHANGE;
+  }
+  return delay;
+}
 
-    if (freq > 1400000000 && frequency <= 1400000000) {
-      tlv320aic3204_set_gain(95, 95);
-      delay += 10;
-    } else
-    if (freq > 1200000000 && frequency <= 1200000000) {
-      tlv320aic3204_set_gain(85, 85);
-      delay += 10;
-    } else
-    if (freq > 900000000 && frequency <= 900000000) {
-      tlv320aic3204_set_gain(75, 75);
-      delay += 10;
-    } else
-    if (freq > 600000000 && frequency <= 600000000) {
-      tlv320aic3204_set_gain(50, 50);
-      delay += 10;
-    } else
-    if (freq > FREQ_HARMONICS && frequency <= FREQ_HARMONICS) {
-      tlv320aic3204_set_gain(40, 40);
-      delay += 10;
-    } else
-    if (freq <= FREQ_HARMONICS && frequency > FREQ_HARMONICS) {
-      tlv320aic3204_set_gain(0, 0);
-      delay += 10;
-    }
-
+int set_frequency(uint32_t freq)
+{
+    int delay = adjust_gain(freq);
     int8_t ds = drive_strength;
     if (ds == DRIVE_STRENGTH_AUTO) {
       ds = freq > FREQ_HARMONICS ? SI5351_CLK_DRIVE_STRENGTH_8MA : SI5351_CLK_DRIVE_STRENGTH_2MA;
@@ -353,6 +352,18 @@ static void cmd_dac(BaseSequentialStream *chp, int argc, char *argv[])
     value = atoi(argv[0]);
     config.dac_value = value;
     dacPutChannelX(&DACD2, 0, value);
+}
+
+static void cmd_threshold(BaseSequentialStream *chp, int argc, char *argv[])
+{
+    int value;
+    if (argc != 1) {
+        chprintf(chp, "usage: threshold {frequency in harmonic mode}\r\n");
+        chprintf(chp, "current: %d\r\n", config.harmonic_freq_threshold);
+        return;
+    }
+    value = atoi(argv[0]);
+    config.harmonic_freq_threshold = value;
 }
 
 static void cmd_saveconfig(BaseSequentialStream *chp, int argc, char *argv[])
@@ -591,16 +602,16 @@ float cal_data[5][101][2];
 #endif
 
 config_t config = {
-  /* magic */   CONFIG_MAGIC,
-  /* dac_value */ 1922,
-  /* grid_color */ 0x1084,
-  /* menu_normal_color */ 0xffff,
-  /* menu_active_color */ 0x7777,
-  /* trace_colors[4] */ { RGB565(0,255,255), RGB565(255,0,40), RGB565(0,0,255), RGB565(50,255,0) },
-  ///* touch_cal[4] */ { 620, 600, 160, 190 },
-  /* touch_cal[4] */ { 693, 605, 124, 171 },
-  /* default_loadcal */    0,
-  /* checksum */           0
+  .magic =             CONFIG_MAGIC,
+  .dac_value =         1922,
+  .grid_color =        0x1084,
+  .menu_normal_color = 0xffff,
+  .menu_active_color = 0x7777,
+  .trace_color =       { RGB565(0,255,255), RGB565(255,0,40), RGB565(0,0,255), RGB565(50,255,0) },
+  .touch_cal =         { 693, 605, 124, 171 },  //{ 620, 600, 160, 190 },
+  .default_loadcal =   0,
+  .harmonic_freq_threshold = 300000000,
+  .checksum =          0
 };
 
 properties_t current_props = {
@@ -641,6 +652,8 @@ ensure_edit_config(void)
   cal_status = 0;
 }
 
+#define DELAY_CHANNEL_CHANGE 1
+
 // main loop for measurement
 bool sweep(bool break_on_operation)
 {
@@ -648,7 +661,7 @@ bool sweep(bool break_on_operation)
 
   for (i = 0; i < sweep_points; i++) {
     int delay = set_frequency(frequencies[i]);
-    tlv320aic3204_select_in3(); // CH0:REFLECT
+    tlv320aic3204_select(0); // CH0:REFLECT
     wait_dsp(delay);
 
     // blink LED while scanning
@@ -657,8 +670,8 @@ bool sweep(bool break_on_operation)
     /* calculate reflection coeficient */
     (*sample_func)(measured[0][i]);
 
-    tlv320aic3204_select_in1(); // CH1:TRANSMISSION
-    wait_dsp(delay);
+    tlv320aic3204_select(1); // CH1:TRANSMISSION
+    wait_dsp(delay + DELAY_CHANNEL_CHANGE);
 
     /* calculate transmission coeficient */
     (*sample_func)(measured[1][i]);
@@ -779,6 +792,8 @@ update_frequencies(void)
   }
 
   set_frequencies(start, stop, sweep_points);
+  operation_requested = OP_FREQCHANGE;
+  
   update_marker_index();
   
   // set grid layout
@@ -815,16 +830,15 @@ freq_mode_centerspan(void)
 #define STOP_MAX 1500000000
 
 void
-set_sweep_frequency(int type, float frequency)
+set_sweep_frequency(int type, int32_t freq)
 {
-  int32_t freq = frequency;
   int cal_applied = cal_status & CALSTAT_APPLY;
   switch (type) {
   case ST_START:
     freq_mode_startstop();
-    if (frequency < START_MIN)
+    if (freq < START_MIN)
       freq = START_MIN;
-    if (frequency > STOP_MAX)
+    if (freq > STOP_MAX)
       freq = STOP_MAX;
     if (frequency0 != freq) {
       ensure_edit_config();
@@ -837,9 +851,9 @@ set_sweep_frequency(int type, float frequency)
     break;
   case ST_STOP:
     freq_mode_startstop();
-    if (frequency > STOP_MAX)
+    if (freq > STOP_MAX)
       freq = STOP_MAX;
-    if (frequency < START_MIN)
+    if (freq < START_MIN)
       freq = START_MIN;
     if (frequency1 != freq) {
       ensure_edit_config();
@@ -891,7 +905,7 @@ set_sweep_frequency(int type, float frequency)
     freq_mode_centerspan();
     if (frequency0 != freq || frequency1 != 0) {
       ensure_edit_config();
-      frequency0 = frequency;
+      frequency0 = freq;
       frequency1 = 0;
       update_frequencies();
     }
@@ -1099,6 +1113,7 @@ eterm_calc_et(void)
   cal_status |= CALSTAT_ET;
 }
 
+#if 0
 void apply_error_term(void)
 {
   int i;
@@ -1130,6 +1145,7 @@ void apply_error_term(void)
     measured[1][i][1] = s21ai;
   }
 }
+#endif
 
 void apply_error_term_at(int i)
 {
@@ -1160,7 +1176,7 @@ void apply_error_term_at(int i)
     measured[1][i][1] = s21ai;
 }
 
-void apply_edelay_at(int i)
+static void apply_edelay_at(int i)
 {
   float w = 2 * M_PI * electrical_delay * frequencies[i] * 1E-12;
   float s = sin(w);
@@ -1280,6 +1296,13 @@ cal_interpolate(int s)
         // found f between freqs at j and j+1
         float k1 = (float)(f - src->_frequencies[j])
                         / (src->_frequencies[j+1] - src->_frequencies[j]);
+        
+        // avoid glitch between freqs in different harmonics mode
+        if (IS_HARMONIC_MODE(src->_frequencies[j]) != IS_HARMONIC_MODE(src->_frequencies[j+1])) {
+          // assume f[j] < f[j+1]
+          k1 = IS_HARMONIC_MODE(f) ? 1.0 : 0.0;
+        }
+
         float k0 = 1.0 - k1;
         for (eterm = 0; eterm < 5; eterm++) {
           cal_data[eterm][i][0] = src->_cal_data[eterm][j][0] * k0 + src->_cal_data[eterm][j+1][0] * k1;
@@ -1302,6 +1325,7 @@ cal_interpolate(int s)
   }
     
   cal_status |= src->_cal_status | CALSTAT_APPLY | CALSTAT_INTERPOLATED;
+  redraw_request |= REDRAW_CAL_STATUS;
 }
 
 static void cmd_cal(BaseSequentialStream *chp, int argc, char *argv[])
@@ -1414,7 +1438,7 @@ const struct {
 } trace_info[] = {
   { "LOGMAG", 7, 10 },
   { "PHASE",  4, 90 },
-  { "DELAY",  4,  1 },
+  { "DELAY",  4,  1e-9 },
   { "SMITH",  0,  1 },
   { "POLAR",  0,  1 },
   { "LINEAR", 0,  0.125 },
@@ -1745,6 +1769,61 @@ static void cmd_frequencies(BaseSequentialStream *chp, int argc, char *argv[])
   }
 }
 
+static void
+set_domain_mode(int mode) // accept DOMAIN_FREQ or DOMAIN_TIME
+{
+  if (mode != (domain_mode & DOMAIN_MODE)) {
+    domain_mode = (domain_mode & ~DOMAIN_MODE) | (mode & DOMAIN_MODE);
+    redraw_request |= REDRAW_FREQUENCY;
+  }
+}
+
+static void
+set_timedomain_func(int func) // accept TD_FUNC_LOWPASS_IMPULSE, TD_FUNC_LOWPASS_STEP or TD_FUNC_BANDPASS
+{
+  domain_mode = (domain_mode & ~TD_FUNC) | (func & TD_FUNC);
+}
+
+static void
+set_timedomain_window(int func) // accept TD_WINDOW_MINIMUM/TD_WINDOW_NORMAL/TD_WINDOW_MAXIMUM
+{
+  domain_mode = (domain_mode & ~TD_WINDOW) | (func & TD_WINDOW);
+}
+
+static void cmd_transform(BaseSequentialStream *chp, int argc, char *argv[])
+{
+  int i;
+  if (argc == 0) {
+    goto usage;
+  }
+
+  for (i = 0; i < argc; i++) {
+    char *cmd = argv[i];
+    if (strcmp(cmd, "on") == 0) {
+      set_domain_mode(DOMAIN_TIME);
+    } else if (strcmp(cmd, "off") == 0) {
+      set_domain_mode(DOMAIN_FREQ);
+    } else if (strcmp(cmd, "impulse") == 0) {
+      set_timedomain_func(TD_FUNC_LOWPASS_IMPULSE);
+    } else if (strcmp(cmd, "step") == 0) {
+      set_timedomain_func(TD_FUNC_LOWPASS_STEP);
+    } else if (strcmp(cmd, "bandpass") == 0) {
+      set_timedomain_func(TD_FUNC_BANDPASS);
+    } else if (strcmp(cmd, "minimum") == 0) {
+      set_timedomain_window(TD_WINDOW_MINIMUM);
+    } else if (strcmp(cmd, "normal") == 0) {
+      set_timedomain_window(TD_WINDOW_NORMAL);
+    } else if (strcmp(cmd, "maximum") == 0) {
+      set_timedomain_window(TD_WINDOW_MAXIMUM);
+    } else {
+      goto usage;
+    }
+  }
+  return;
+
+usage:
+  chprintf(chp, "usage: transform {on|off|impulse|step|bandpass|minimum|normal|maximum} [...]\r\n");
+}
 
 static void cmd_test(BaseSequentialStream *chp, int argc, char *argv[])
 {
@@ -1825,10 +1904,7 @@ static void cmd_port(BaseSequentialStream *chp, int argc, char *argv[])
     return;
   }
   port = atoi(argv[0]);
-  if (port)
-    tlv320aic3204_select_in1();
-  else
-    tlv320aic3204_select_in3(); // default
+  tlv320aic3204_select(port);
 }
 
 static void cmd_stat(BaseSequentialStream *chp, int argc, char *argv[])
@@ -1926,6 +2002,8 @@ static const ShellCommand commands[] =
     { "edelay", cmd_edelay },
     { "capture", cmd_capture },
     { "vbat", cmd_vbat },
+    { "transform", cmd_transform },
+    { "threshold", cmd_threshold },
     { NULL, NULL }
 };
 
@@ -2052,5 +2130,6 @@ void HardFault_Handler(void)
 
 void hard_fault_handler_c(uint32_t* sp)
 {
+  (void)sp;
   while (true) {}
 }

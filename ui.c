@@ -20,6 +20,7 @@
 
 #include "ch.h"
 #include "hal.h"
+#include "chprintf.h"
 #include "nanovna.h"
 #include <stdlib.h>
 #include <string.h>
@@ -58,7 +59,6 @@ static uint32_t last_button_down_ticks;
 static uint32_t last_button_repeat_ticks;
 static int8_t inhibit_until_release = FALSE;
 
-enum { OP_NONE = 0, OP_LEVER, OP_TOUCH };
 uint8_t operation_requested = OP_NONE;
 
 int8_t previous_marker = -1;
@@ -68,7 +68,7 @@ enum {
 };
 
 enum {
-  KM_START, KM_STOP, KM_CENTER, KM_SPAN, KM_CW, KM_SCALE, KM_REFPOS, KM_EDELAY, KM_VELOCITY_FACTOR
+  KM_START, KM_STOP, KM_CENTER, KM_SPAN, KM_CW, KM_SCALE, KM_REFPOS, KM_EDELAY, KM_VELOCITY_FACTOR, KM_SCALEDELAY
 };
 
 uint8_t ui_mode = UI_NORMAL;
@@ -742,12 +742,16 @@ static void
 menu_scale_cb(int item)
 {
   int status;
+  int km = KM_SCALE + item;
+  if (km == KM_SCALE && trace[uistat.current_trace].type == TRC_DELAY) {
+    km = KM_SCALEDELAY;
+  }
   status = btn_wait_release();
   if (status & EVT_BUTTON_DOWN_LONG) {
-    ui_mode_numeric(KM_SCALE + item);
+    ui_mode_numeric(km);
     ui_process_numeric();
   } else {
-    ui_mode_keypad(KM_SCALE + item);
+    ui_mode_keypad(km);
     ui_process_keypad();
   }
 }
@@ -1050,7 +1054,6 @@ const menuitem_t menu_top[] = {
   { MT_SUBMENU, "CAL", menu_cal },
   { MT_SUBMENU, "RECALL", menu_recall },
   { MT_SUBMENU, "CONFIG", menu_config },
-  { MT_CLOSE, "CLOSE", NULL },
   { MT_NONE, NULL, NULL } // sentinel
 };
 
@@ -1145,11 +1148,10 @@ void menu_invoke(int item)
 #define KP_BS 16
 #define KP_INF 17
 #define KP_DB 18
-#define KP_SPK 19
-#define KP_ANT 20
-#define KP_KEYPAD 21
-#define KP_N 22
-#define KP_P 23
+#define KP_PLUSMINUS 19
+#define KP_KEYPAD 20
+#define KP_N 21
+#define KP_P 22
 
 typedef struct {
   uint16_t x, y;
@@ -1208,8 +1210,9 @@ const keypads_t keypads_time[] = {
   { KP_X(0), KP_Y(0), 7 },
   { KP_X(1), KP_Y(0), 8 },
   { KP_X(2), KP_Y(0), 9 },
-  { KP_X(3), KP_Y(2), KP_N },
-  { KP_X(3), KP_Y(3), KP_P },
+  { KP_X(3), KP_Y(1), KP_N },
+  { KP_X(3), KP_Y(2), KP_P },
+  { KP_X(3), KP_Y(3), KP_MINUS },
   { KP_X(2), KP_Y(3), KP_BS },
   { 0, 0, -1 }
 };
@@ -1221,13 +1224,14 @@ const keypads_t * const keypads_mode_tbl[] = {
   keypads_freq, // span
   keypads_freq, // cw freq
   keypads_scale, // scale
-  keypads_scale, // respos
+  keypads_scale, // refpos
   keypads_time, // electrical delay
-  keypads_scale // velocity factor
+  keypads_scale, // velocity factor
+  keypads_time // scale of delay
 };
 
 const char * const keypad_mode_label[] = {
-  "START", "STOP", "CENTER", "SPAN", "CW FREQ", "SCALE", "REFPOS", "EDELAY", "VELOCITY%"
+  "START", "STOP", "CENTER", "SPAN", "CW FREQ", "SCALE", "REFPOS", "EDELAY", "VELOCITY%", "DELAY"
 };
 
 void
@@ -1239,7 +1243,7 @@ draw_keypad(void)
     if (i == selection)
       bg = config.menu_active_color;
     ili9341_fill(keypads[i].x, keypads[i].y, 44, 44, bg);
-    ili9341_drawfont(keypads[i].c, &NF20x24, keypads[i].x+12, keypads[i].y+10, 0x0000, bg);
+    ili9341_drawfont(keypads[i].c, &NF20x22, keypads[i].x+12, keypads[i].y+10, 0x0000, bg);
     i++;
   }
 }
@@ -1249,7 +1253,7 @@ draw_numeric_area_frame(void)
 {
   ili9341_fill(0, 208, 320, 32, 0xffff);
   ili9341_drawstring_5x7(keypad_mode_label[keypad_mode], 10, 220, 0x0000, 0xffff);
-  ili9341_drawfont(KP_KEYPAD, &NF20x24, 300, 216, 0x0000, 0xffff);
+  ili9341_drawfont(KP_KEYPAD, &NF20x22, 300, 216, 0x0000, 0xffff);
 }
 
 void
@@ -1280,9 +1284,9 @@ draw_numeric_input(const char *buf)
     }
 
     if (c >= 0)
-      ili9341_drawfont(c, &NF20x24, x, 208+4, fg, bg);
+      ili9341_drawfont(c, &NF20x22, x, 208+4, fg, bg);
     else if (focused)
-      ili9341_drawfont(0, &NF20x24, x, 208+4, fg, bg);
+      ili9341_drawfont(0, &NF20x22, x, 208+4, fg, bg);
     else
       ili9341_fill(x, 208+4, 20, 24, bg);
       
@@ -1487,6 +1491,9 @@ fetch_numeric_target(void)
   case KM_VELOCITY_FACTOR:
     uistat.value = velocity_factor;
     break;
+  case KM_SCALEDELAY:
+    uistat.value = get_trace_scale(uistat.current_trace) * 1e12;
+    break;
   }
   
   {
@@ -1647,13 +1654,16 @@ ui_process_menu(void)
       menu_invoke(selection);
     } else {
       do {
-        if (status & EVT_UP
-            && menu_stack[menu_current_level][selection+1].type != MT_NONE) {
+        if (status & EVT_UP) {
+          // close menu if next item is sentinel
+          if (menu_stack[menu_current_level][selection+1].type == MT_NONE)
+            goto menuclose;
           selection++;
           draw_menu();
         }
-        if (status & EVT_DOWN
-            && selection > 0) {
+        if (status & EVT_DOWN) {
+          if (selection == 0)
+            goto menuclose;
           selection--;
           draw_menu();
         }
@@ -1661,6 +1671,10 @@ ui_process_menu(void)
       } while (status != 0);
     }
   }
+  return;
+
+menuclose:
+  ui_mode_normal();
 }
 
 static int
@@ -1706,6 +1720,9 @@ keypad_click(int key)
     case KM_VELOCITY_FACTOR:
       velocity_factor = value;
       break;
+    case KM_SCALEDELAY:
+      set_trace_scale(uistat.current_trace, value * 1e-12); // pico second
+      break;
     }
 
     return KP_DONE;
@@ -1719,6 +1736,9 @@ keypad_click(int key)
     // append period if there are no period
     if (kp_index == j)
       kp_buf[kp_index++] = '.';
+  } else if (c == KP_MINUS) {
+    if (kp_index == 0)
+      kp_buf[kp_index++] = '-';
   } else if (c == KP_BS) {
     if (kp_index == 0) {
       return KP_CANCEL;
